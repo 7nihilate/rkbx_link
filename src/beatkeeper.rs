@@ -270,6 +270,7 @@ impl BeatKeeper {
                     keeper.report_error(e);
 
                     rekordbox = None;
+                    crate::status::shared().update_status(|s| s.rekordbox_connected = false);
                     logger.err("Connection to Rekordbox lost");
                     logger.info("Reconnecting in 3s...");
                     thread::sleep(Duration::from_secs(3));
@@ -286,6 +287,7 @@ impl BeatKeeper {
                         rekordbox = Some(rb);
                         println!();
                         logger.good("Connected to Rekordbox!");
+                        crate::status::shared().update_status(|s| s.rekordbox_connected = true);
                         keeper.last_error = None;
                     }
                     Err(e) => {

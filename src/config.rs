@@ -66,6 +66,10 @@ impl Config {
         }
     }
 
+    pub fn set(&mut self, key: &str, value: &str) {
+        self.entries.insert(key.to_string(), value.to_string());
+    }
+
     pub fn reduce_to_namespace(&self, namespace: &str) -> Config {
         Config {
             entries: self.entries.clone(),

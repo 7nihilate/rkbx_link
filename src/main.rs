@@ -14,6 +14,10 @@ mod config;
 mod log;
 mod utils;
 mod memory;
+mod status;
+mod gui;
+
+use status::{shared, OscMode};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -32,7 +36,69 @@ const OFFSETS_PATH: &str = "./data/offsets";
 #[cfg(target_os = "macos")]
 const OFFSETS_PATH: &str = "./data/offsets-macos";
 
+struct Args {
+    /// --local / --lan: overrides osc.mode
+    osc_mode: Option<OscMode>,
+    /// --nogui: console only, as before
+    no_gui: bool,
+}
+
+fn parse_args() -> Args {
+    let mut args = Args {
+        osc_mode: None,
+        no_gui: false,
+    };
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--local" => args.osc_mode = Some(OscMode::Local),
+            "--lan" => args.osc_mode = Some(OscMode::Lan),
+            "--nogui" => args.no_gui = true,
+            other => println!("Unknown argument '{other}' (use --local, --lan, --nogui)"),
+        }
+    }
+    args
+}
+
 fn main() {
+    // config and data/offsets are read relative to the working directory: use the
+    // exe's folder, so it works when started from a shortcut or from another program
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        let _ = std::env::set_current_dir(dir);
+    }
+
+    let args = parse_args();
+    let gui = !args.no_gui && read_config_flag("app.gui", true);
+
+    if !gui {
+        run(args.osc_mode, false);
+        return;
+    }
+
+    let osc_mode = args.osc_mode;
+    std::thread::spawn(move || run(osc_mode, true));
+    if let Err(e) = gui::run() {
+        println!("Could not open the window ({e}), running in the console. Use --nogui to skip the window.");
+        loop {
+            std::thread::park();
+        }
+    }
+    // Closing the window quits, even while the worker waits on Rekordbox
+    std::process::exit(0);
+}
+
+/// Reads one boolean before the logger exists, without warnings for missing keys
+fn read_config_flag(key: &str, default: bool) -> bool {
+    let Ok(src) = fs::read_to_string("config") else {
+        return default;
+    };
+    src.lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix(key).and_then(|v| v.strip_prefix(' ')))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+fn run(osc_mode: Option<OscMode>, gui: bool) {
     println!();
     println!("======================================================================");
     println!();
@@ -65,6 +131,16 @@ fn main() {
     config.logger = ScopedLogger::new(&logger, "Config");
     let applogger = ScopedLogger::new(&logger, "App");
 
+    if let Some(mode) = osc_mode {
+        let osc_config = config.reduce_to_namespace("osc");
+        let mut target = outputmodules::osc::target_from_config(&osc_config, &ScopedLogger::new(&logger, "OSC"));
+        target.mode = mode;
+        shared().set_osc_target(target);
+        applogger.info(&format!("OSC mode from the command line: {}", mode.as_str()));
+    }
+    // The status module feeds the window, so it runs only with the window
+    config.set("status.enabled", if gui { "true" } else { "false" });
+
     let modules = vec![
         ModuleDefinition::new(
             "link",
@@ -83,6 +159,11 @@ fn main() {
             "display",
             "Live Display",
             outputmodules::display::Display::create,
+        ),
+        ModuleDefinition::new(
+            "status",
+            "Status window",
+            outputmodules::status::Status::create,
         ),
     ];
 
@@ -120,6 +201,7 @@ fn main() {
     };
 
     applogger.info(&format!("Targeting Rekordbox version: {selected_version}"));
+    shared().update_status(|s| s.target_version = selected_version.clone());
 
     let offset = if let Some(offset) = offsets.get(&selected_version) {
         offset

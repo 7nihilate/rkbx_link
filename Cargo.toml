@@ -18,6 +18,8 @@ notify = "8.2.0"
 sacn = "0.11.1"
 
 sysinfo = "0.38.4"
+eframe = "0.32.3"
+if-addrs = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 # toy-arms = {version = "0.9.4", features = ["external"]}

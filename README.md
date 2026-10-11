@@ -69,6 +69,11 @@ Here's in detail how to configure the app, beat tracking and output modules. The
 - `app.license <string>`
 Enter your license key here to get support for the latest Rekordbox versions. Otherwise leave it empty.
 
+- `app.gui <true/false>`
+Shows a status window: Rekordbox connection, the master deck, where OSC goes (switchable between this PC and the network while running), and the log. Default true. Start with `--nogui` to skip it.
+
+Command line flags: `--local` and `--lan` override `osc.mode`, `--nogui` runs in the console only. The program always reads `config` and `data/` from its own folder, wherever it is started from.
+
 - `app.auto_update <true/false>`
 Enables checking for updates on startup if you have a valid [license](https://3gg.se/products/rkbx_link). 
 
@@ -103,11 +108,20 @@ Outputs transport and more data over OSC. Check further down in this document fo
 - `osc.enabled <true/false>`
 Whether to enable OSC output.
 
+- `osc.mode <local/lan>`
+`local` sends to `127.0.0.1:osc.port`, for a receiver on this machine. `lan` sends to `osc.destination`, for a receiver on another machine. Without this key, a loopback `osc.destination` means local.
+
+- `osc.port <int>`
+Receiver port in local mode. Default is the port of `osc.destination`.
+
 - `osc.source <IP address>`
-Local address to bind to. Default is 127.0.0.1:4450
+Local address to bind to. Default is 0.0.0.0:4450. Bind to 0.0.0.0 to send to other machines.
 
 - `osc.destination <IP address>`
-Address to send OSC messages to. Default is 127.0.0.1:4460
+Address to send OSC messages to in lan mode. Use the subnet broadcast address (e.g. 192.168.50.255:4460) and every receiver on that network gets the messages without knowing its IP; the window lists the broadcast address of each network adapter.
+
+- `osc.heartbeat <seconds>`
+Re-sends the master track, tempo and phrase at this interval, so a receiver that starts or restarts in the middle of a track catches up. Default 2.0, 0 disables.
 
 - `osc.send_every_nth <int>`
 Will throttle messages to only send every update_rate/send_every_nth. While tracking might run at 120Hz, OSC probably only needs to be sent at 60Hz (2) or 30Hz (4), so default of 2 is good.

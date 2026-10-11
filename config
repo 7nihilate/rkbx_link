@@ -11,6 +11,8 @@ app.auto_update false
 app.debug false
 # Accept all y/n questions (mainly for use in non-user-controlled environments)
 app.yes_to_all false
+# Show the status window (--nogui on the command line skips it)
+app.gui true
 
 # == Beatkeeper ==
 # Rekordbox version to target
@@ -42,16 +44,24 @@ link.cumulative_error_tolerance 0.05
 
 # == Open Sound Control ==
 osc.enabled true
-# Local address to bind to
-osc.source 127.0.0.1:4450
-# Remote address to send to
-osc.destination 127.0.0.1:4460
+# Where to send: "local" = this PC (127.0.0.1:osc.port), "lan" = osc.destination.
+# --local / --lan on the command line override this, the window can change it live.
+osc.mode local
+# Receiver port in local mode
+osc.port 4460
+# Local address to bind to (0.0.0.0 so it can send to other machines)
+osc.source 0.0.0.0:4450
+# Target in lan mode, normally the subnet broadcast so any receiver on the LAN hears it
+osc.destination 192.168.50.255:4460
+# Re-send track, tempo and phrase every n seconds so a receiver that restarts
+# catches up. 0 disables
+osc.heartbeat 2.0
 # Time-critical OSC messages will be sent at update_rate/this value.
 # Increasing this saves bandwidth
 # Not all apps can handle 120*n messages per second
 osc.send_every_nth 2
 # Format for phrase output [string, int, float]
-osc.phrase_output_format int
+osc.phrase_output_format string
 # Also send a 0 value to simulate the release of a button for triggers
 osc.trigger_autorelease false
 
@@ -59,8 +69,8 @@ osc.trigger_autorelease false
 # "master" enables messages from the current active deck
 # "n" enables sending of all decks on separate addresses
 # See readme for details
-osc.msg.master/time false
-osc.msg.master/phrase false
+osc.msg.master/time true
+osc.msg.master/phrase true
 
 osc.msg.n/time false
 osc.msg.n/phrase false
@@ -68,8 +78,8 @@ osc.msg.n/phrase false
 # Send the current beat as a fraction of an interval
 # Or send a trigger message every interval
 # Comma separated floats signify the period (0.25=every 16th, 1=every beat). Empty to disable
-osc.msg.master/beat/subdiv 4
-osc.msg.master/beat/trigger
+osc.msg.master/beat/subdiv 1,4,16
+osc.msg.master/beat/trigger 1,4
 
 osc.msg.n/beat/subdiv
 osc.msg.n/beat/trigger

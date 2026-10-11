@@ -8,6 +8,7 @@ pub mod file;
 pub mod osc;
 pub mod setlist;
 pub mod sacn;
+pub mod status;
 
 pub trait OutputModule {
 

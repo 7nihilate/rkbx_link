@@ -2,7 +2,9 @@ use std::io::Write;
 use std::{cell::RefCell, rc::Rc};
 use termcolor::{ColorChoice, ColorSpec, StandardStream, WriteColor};
 
-#[derive(PartialEq)]
+use crate::status::LogKind;
+
+#[derive(PartialEq, Clone, Copy)]
 pub enum LogLevel {
     Debug = 0,
     Good = 1,
@@ -45,6 +47,15 @@ impl Logger {
         if writeln!(&mut self.stdout.borrow_mut(), "[{source}]  {message}").is_err() {
             println!("Log failed: [{source}]  {message}");
         }
+
+        let kind = match level {
+            LogLevel::Debug => LogKind::Debug,
+            LogLevel::Good => LogKind::Good,
+            LogLevel::Info => LogKind::Info,
+            LogLevel::Warning => LogKind::Warning,
+            LogLevel::Error => LogKind::Error,
+        };
+        crate::status::shared().push_log(kind, format!("[{source}]  {message}"));
     }
 
     pub fn debug(&self, source: &str, message: &str) {

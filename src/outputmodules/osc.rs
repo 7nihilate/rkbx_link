@@ -1,8 +1,16 @@
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use rosc::{encoder::encode, OscMessage, OscPacket};
 
-use crate::{beatkeeper::TrackInfo, config::Config, log::ScopedLogger, utils::PhraseParser};
+use crate::{
+    beatkeeper::TrackInfo,
+    config::Config,
+    log::ScopedLogger,
+    status::{shared, OscMode, OscTarget},
+    utils::PhraseParser,
+};
 
 use super::{ModuleCreateOutput, OutputModule};
 
@@ -87,8 +95,22 @@ impl MessageToggles{
     } 
 }
 
+/// Last master values, re-sent by the heartbeat so a receiver that starts late
+/// (or restarts) learns the track, tempo and phrase without waiting for a change
+#[derive(Default)]
+struct MasterCache {
+    bpm: Option<f32>,
+    original_bpm: Option<f32>,
+    track: Option<TrackInfo>,
+    phrase: Option<String>,
+    next_phrase: Option<String>,
+    countin: Option<i32>,
+}
+
 pub struct Osc {
     socket: UdpSocket,
+    target: Option<SocketAddr>,
+    target_generation: u64,
     info_sent: bool,
     logger: ScopedLogger,
     message_toggles: MessageToggles,
@@ -96,6 +118,9 @@ pub struct Osc {
     send_period_counter: i32,
     last_beat_master: f32,
     last_beats: Vec<f32>,
+    heartbeat: Option<Duration>,
+    last_heartbeat: Instant,
+    cache: MasterCache,
 }
 
 
@@ -134,39 +159,55 @@ impl Osc {
                 return;
             }
         };
-        if let Err(e) = self.socket.send(&packet) {
-            self.logger.err(&format!("Failed to send OSC message: {e}"));
+        let Some(target) = self.target else {
+            return;
+        };
+        match self.socket.send_to(&packet, target) {
+            Ok(_) => {
+                shared().packets_sent.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                let msg = format!("Failed to send OSC message to {target}: {e}");
+                let mut is_new = false;
+                shared().update_status(|s| {
+                    is_new = s.last_osc_error != msg;
+                    s.last_osc_error = msg.clone();
+                });
+                // Every packet fails the same way while the network is down: log it once
+                if is_new {
+                    self.logger.err(&msg);
+                }
+            }
         };
     }
 }
 
 impl Osc {
     pub fn create(conf: Config, logger: ScopedLogger) -> ModuleCreateOutput {
-        let socket =
-            match UdpSocket::bind(conf.get_or_default("source", "127.0.0.1:8888".to_string())) {
-                Ok(socket) => socket,
-                Err(e) => {
-                    logger.err(&format!("Failed to open source socket: {e}"));
-                    return Err(());
-                }
-            };
-
-        if let Err(e) =
-            socket.connect(conf.get_or_default("destination", "127.0.0.1:9999".to_string()))
-        {
-            logger.err(&format!("Failed to open connection to receiver: {e}"));
-            return Err(());
-        }
-        // Try to connect to destination, but don't fail if receiver isn't ready yet
-        // UDP doesn't require an established connection to send
-        let destination = conf.get_or_default("destination", "127.0.0.1:9999".to_string());
-        if let Err(e) = socket.connect(&destination) {
-            logger.warn(&format!("Could not open UDP socket to OSC receiver at {}: {}", destination, e));
-            logger.info("OSC will continue attempting to send messages");
+        let source = conf.get_or_default("source", "0.0.0.0:4450".to_string());
+        let socket = match UdpSocket::bind(&source) {
+            Ok(socket) => socket,
+            Err(e) => {
+                logger.err(&format!("Failed to open source socket {source}: {e}"));
+                return Err(());
+            }
+        };
+        // Needed to send to a subnet broadcast address in LAN mode
+        if let Err(e) = socket.set_broadcast(true) {
+            logger.warn(&format!("Could not enable broadcast on the OSC socket: {e}"));
         }
 
-        Ok(Box::new(Osc {
+        // The command line (--local / --lan) may already have set the target
+        if shared().osc_target().is_none() {
+            shared().set_osc_target(target_from_config(&conf, &logger));
+        }
+
+        let heartbeat: f32 = conf.get_or_default("heartbeat", 2.0);
+
+        let mut osc = Osc {
             socket,
+            target: None,
+            target_generation: u64::MAX,
             info_sent: false,
             logger: logger.clone(),
             message_toggles: MessageToggles::new(&conf, logger),
@@ -174,7 +215,98 @@ impl Osc {
             send_period_counter: 0,
             last_beat_master: 0.0,
             last_beats: vec![0.0; 4],
-        }))
+            heartbeat: (heartbeat > 0.0).then(|| Duration::from_secs_f32(heartbeat)),
+            last_heartbeat: Instant::now(),
+            cache: MasterCache::default(),
+        };
+        osc.refresh_target();
+        Ok(Box::new(osc))
+    }
+
+    /// Picks up a target change made from the GUI
+    fn refresh_target(&mut self) {
+        let generation = shared().osc_target_generation.load(Ordering::SeqCst);
+        if generation == self.target_generation {
+            return;
+        }
+        self.target_generation = generation;
+        let Some(target) = shared().osc_target() else {
+            return;
+        };
+        match target.resolve() {
+            Ok(addr) => {
+                self.target = Some(addr);
+                self.logger
+                    .info(&format!("Sending OSC to {addr} ({} mode)", target.mode.as_str()));
+                shared().update_status(|s| s.last_osc_error.clear());
+                // A new receiver knows nothing yet
+                self.send_cached_state();
+            }
+            Err(e) => {
+                self.target = None;
+                self.logger.err(&e);
+                shared().update_status(|s| s.last_osc_error = e.clone());
+            }
+        }
+    }
+
+    fn send_cached_state(&mut self) {
+        if let Some(bpm) = self.cache.bpm {
+            self.send_float("/master/bpm/current", bpm);
+        }
+        if let Some(bpm) = self.cache.original_bpm {
+            self.send_float("/master/bpm/original", bpm);
+        }
+        if let Some(track) = self.cache.track.clone() {
+            self.send_track_master(&track);
+        }
+        if self.message_toggles.phrase_master {
+            if let Some(phrase) = self.cache.phrase.clone() {
+                self.output_phrase("/master/phrase/current", &phrase);
+            }
+            if let Some(phrase) = self.cache.next_phrase.clone() {
+                self.output_phrase("/master/phrase/next", &phrase);
+            }
+            if let Some(beats) = self.cache.countin {
+                self.send_float("/master/phrase/countin", beats as f32);
+            }
+        }
+    }
+
+    fn send_track_master(&self, track: &TrackInfo) {
+        self.send_string("/master/track/title", &track.title);
+        self.send_string("/master/track/artist", &track.artist);
+        self.send_string("/master/track/album", &track.album);
+    }
+}
+
+/// osc.mode picks the target: "local" sends to 127.0.0.1:osc.port, "lan" sends to
+/// osc.destination (normally the subnet broadcast). Without osc.mode, a loopback
+/// osc.destination means local and anything else means lan.
+pub fn target_from_config(conf: &Config, logger: &ScopedLogger) -> OscTarget {
+    let destination = conf.get_or_default("destination", "127.0.0.1:4460".to_string());
+    let default_port = destination
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(4460);
+    let mode = match conf.get::<String>("mode") {
+        Some(m) => OscMode::from_str(&m).unwrap_or_else(|| {
+            logger.err(&format!("Unknown osc.mode '{m}', use local or lan"));
+            OscMode::Local
+        }),
+        None => {
+            if destination.starts_with("127.") || destination.starts_with("localhost") {
+                OscMode::Local
+            } else {
+                OscMode::Lan
+            }
+        }
+    };
+    OscTarget {
+        mode,
+        port: conf.get_or_default("port", default_port),
+        lan_destination: destination,
     }
 }
 
@@ -182,9 +314,20 @@ impl Osc {
 impl OutputModule for Osc {
     fn pre_update(&mut self) {
         self.send_period_counter = (self.send_period_counter + 1) % self.send_period;
+        self.refresh_target();
+
+        let resend = shared().resend_requested.swap(false, Ordering::SeqCst);
+        let heartbeat_due = self
+            .heartbeat
+            .is_some_and(|period| self.last_heartbeat.elapsed() >= period);
+        if resend || heartbeat_due {
+            self.last_heartbeat = Instant::now();
+            self.send_cached_state();
+        }
     }
 
     fn bpm_changed_master(&mut self, bpm: f32) {
+        self.cache.bpm = Some(bpm);
         self.send_float("/master/bpm/current", bpm);
     }
 
@@ -193,6 +336,7 @@ impl OutputModule for Osc {
     }
 
     fn original_bpm_changed_master(&mut self, bpm: f32) {
+        self.cache.original_bpm = Some(bpm);
         self.send_float("/master/bpm/original", bpm);
     }
 
@@ -268,44 +412,42 @@ impl OutputModule for Osc {
     }
 
     fn track_changed_master(&mut self, track: &TrackInfo) {
-        self.send_string("/master/track/title", &track.title);
-        self.send_string("/master/track/artist", &track.artist);
-        self.send_string("/master/track/album", &track.album);
+        self.cache.track = Some(track.clone());
+        self.send_track_master(track);
     }
 
     fn slow_update(&mut self) {
         if !self.info_sent {
             self.info_sent = true;
-
-            let target_addr = if let Ok(addr) = self.socket.peer_addr() {
-                addr.to_string()
-            } else {
-                "No target!!".to_string()
+            let source_addr = match self.socket.local_addr() {
+                Ok(addr) => addr.to_string(),
+                Err(_) => "No source!!".to_string(),
             };
-
-            let source_addr = if let Ok(addr) = self.socket.local_addr() {
-                addr.to_string()
-            } else {
-                "No source!!".to_string()
+            let target_addr = match self.target {
+                Some(addr) => addr.to_string(),
+                None => "No target!!".to_string(),
             };
             self.logger
                 .info(&format!("Sending {source_addr} -> {target_addr}"));
-            }
+        }
     }
 
     fn phrase_changed_master(&mut self, phrase: &str) {
+        self.cache.phrase = Some(phrase.to_string());
         if self.message_toggles.phrase_master{
             self.output_phrase("/master/phrase/current", phrase);
         }
     }
 
     fn next_phrase_changed_master(&mut self, phrase: &str) {
+        self.cache.next_phrase = Some(phrase.to_string());
         if self.message_toggles.phrase_master{
             self.output_phrase("/master/phrase/next", phrase);
         }
     }
 
     fn next_phrase_in_master(&mut self, beats: i32) {
+        self.cache.countin = Some(beats);
         if self.message_toggles.phrase_master{
             self.send_float("/master/phrase/countin", beats as f32);
         }
