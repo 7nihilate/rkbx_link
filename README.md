@@ -164,6 +164,12 @@ The below is listed as `config key`: `what addresses it enables`
  - `/[deck]/phrase/current` (float/int/string depending on config) The current phrase
  - `/[deck]/phrase/next` (float/int/string) The next phrase coming up
  - `/[deck]/phrase/countin` (float) Beats until the next phrase begins.
+ - `/rkbx/alive` (int) Sent every second in every state, also while Rekordbox is closed or has nothing loaded: `1` = attached to Rekordbox and reading a master deck, `0` = rkbx_link is running but has no Rekordbox data. A receiver that stops getting it knows rkbx_link itself is gone or hung.
+
+### Control messages (receiver to rkbx_link)
+rkbx_link listens on its OSC source socket (`osc.source`, default port 4450) for messages without arguments. Send them back to the address the OSC comes from:
+ - `/rkbx/reconnect` Drop the Rekordbox connection and attach again, then re-send track, tempo and phrase. The same as the "Reconnect to Rekordbox" button in the window.
+ - `/rkbx/resend` Re-send the cached track, tempo and phrase now. The same as the "Resend state" button.
 
 ## Track to file
 - `file.enabled <true/false>`
@@ -207,6 +213,9 @@ This is a known issue mostly when loading tracks for the first time from streami
 - Check that have the correct number of decks set in the config file. Selecting 4 decks when you only have 2 will prevent the program from connecting.
 - Ensure Rekordbox is running and has a track loaded in the deck you are trying to read.
 - Try updating the program or the offsets.
+
+### The output freezes or goes silent while Rekordbox keeps running
+Rekordbox moves its deck data around (decks unloaded, a long idle, a reload). rkbx_link looks the data up again every second and attaches to Rekordbox again when no master deck has been readable for 5 seconds, so this should clear by itself. To force it, press "Reconnect to Rekordbox" in the window or send `/rkbx/reconnect` (see Control messages). If `/rkbx/alive` stops arriving, rkbx_link itself has stopped: restart it.
 
 ### Some decks are not working
 Make sure you have the correct number of decks set in the config file.

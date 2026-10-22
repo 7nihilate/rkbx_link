@@ -37,7 +37,7 @@ display.interval 1.0
 
 
 # == Ableton Link ==
-link.enabled true
+link.enabled false
 # Cumulative time error before forcing a correction
 link.cumulative_error_tolerance 0.05
 

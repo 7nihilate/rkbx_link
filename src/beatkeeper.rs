@@ -33,7 +33,8 @@ pub struct Rekordbox {
     anlz_paths: Vec<PointerChainValue<[u8; 500]>>,
     deckcount: usize,
     phraseparser: PhraseParser,
-    mem: MemReader
+    mem: MemReader,
+    offsets: RekordboxOffsets,
 }
 
 impl Rekordbox {
@@ -57,8 +58,24 @@ impl Rekordbox {
             track_infos,
             anlz_paths,
             phraseparser: PhraseParser::new(),
-            mem
+            mem,
+            offsets,
         })
+    }
+
+    /// Walks the pointer chains of the fixed-address values again. They are resolved once at
+    /// connect, and Rekordbox moves its deck objects (decks unloaded, idle, reloaded): the old
+    /// addresses stay readable but freeze, so a stale value never errors. On failure the old
+    /// addresses are kept (Rekordbox may be mid-reload) and the error is returned.
+    fn refresh(&mut self) -> Result<(), MemoryReadError> {
+        let decks = self.deckcount;
+        let current_bpms = self.mem.new_values(&self.offsets.current_bpm[0..decks])?;
+        let sample_positions = self.mem.new_values(&self.offsets.sample_position[0..decks])?;
+        let masterdeck_index = self.mem.new_value(&self.offsets.masterdeck_index)?;
+        self.current_bpms = current_bpms;
+        self.sample_positions = sample_positions;
+        self.masterdeck_index = masterdeck_index;
+        Ok(())
     }
 
     fn read_timing_data(&self, deck: usize) -> Result<TimingDataRaw, MemoryReadError> {
@@ -259,32 +276,83 @@ impl BeatKeeper {
 
         let period = Duration::from_micros(1000000 / update_rate); // 50Hz
         let mut n = 0;
+        // Self-healing: re-resolve the value pointers every REFRESH_EVERY, and attach to
+        // Rekordbox again when no master deck has been readable for NO_MASTER_REATTACH.
+        const REFRESH_EVERY: Duration = Duration::from_secs(1);
+        const NO_MASTER_REATTACH: Duration = Duration::from_secs(5);
+        let mut last_refresh = std::time::Instant::now();
+        let mut no_master_since: Option<std::time::Instant> = None;
+        let mut no_master_logged = false;
 
         logger.info("Looking for Rekordbox...");
         println!();
 
         loop {
-            if let Some(rb) = &rekordbox {
+            if crate::status::shared().reconnect_requested.swap(false, std::sync::atomic::Ordering::SeqCst)
+                && rekordbox.is_some()
+            {
+                logger.info("Reconnecting to Rekordbox (requested)");
+                rekordbox = None;
+                no_master_since = None;
+                no_master_logged = false;
+                crate::status::shared().update_status(|s| s.rekordbox_connected = false);
+            }
+            if let Some(rb) = &mut rekordbox {
                 let update_start_time = std::time::Instant::now();
-                if let Err(e) = keeper.update(rb, n == 0) {
-                    keeper.report_error(e);
+                match keeper.update(rb, n == 0) {
+                    Err(e) => {
+                        keeper.alive(false);
+                        keeper.report_error(e);
 
-                    rekordbox = None;
-                    crate::status::shared().update_status(|s| s.rekordbox_connected = false);
-                    logger.err("Connection to Rekordbox lost");
-                    logger.info("Reconnecting in 3s...");
-                    thread::sleep(Duration::from_secs(3));
-                } else {
-                    n = (n + 1) % slow_update_denominator;
-                    let elapsed = update_start_time.elapsed();
-                    if period > elapsed {
-                        thread::sleep(period - elapsed);
+                        rekordbox = None;
+                        no_master_since = None;
+                        crate::status::shared().update_status(|s| s.rekordbox_connected = false);
+                        logger.err("Connection to Rekordbox lost");
+                        logger.info("Reconnecting in 3s...");
+                        thread::sleep(Duration::from_secs(3));
+                    }
+                    Ok(master_ok) => {
+                        keeper.alive(master_ok);
+                        if last_refresh.elapsed() >= REFRESH_EVERY {
+                            last_refresh = std::time::Instant::now();
+                            if let Err(e) = rb.refresh() {
+                                logger.debug(&format!("Pointer refresh failed at {:#x}, keeping the old ones", e.address));
+                            }
+                        }
+                        if master_ok {
+                            no_master_since = None;
+                            no_master_logged = false;
+                        } else if no_master_since.is_none() {
+                            no_master_since = Some(std::time::Instant::now());
+                        }
+                        if no_master_since.is_some_and(|t| t.elapsed() >= NO_MASTER_REATTACH) {
+                            // Stale pointers, or Rekordbox reloaded its decks: attach again
+                            if !no_master_logged {
+                                logger.info("No master deck readable for 5 s, attaching to Rekordbox again (repeats quietly while no deck is loaded)");
+                                no_master_logged = true;
+                            }
+                            rekordbox = None;
+                            no_master_since = None;
+                            thread::sleep(Duration::from_millis(500));
+                            continue;
+                        }
+                        n = (n + 1) % slow_update_denominator;
+                        let elapsed = update_start_time.elapsed();
+                        if period > elapsed {
+                            thread::sleep(period - elapsed);
+                        }
                     }
                 }
             } else {
+                keeper.alive(false);
                 match Rekordbox::new(offsets.clone(), config.get_or_default("keeper.decks", 2)) {
                     Ok(rb) => {
                         rekordbox = Some(rb);
+                        last_refresh = std::time::Instant::now();
+                        if no_master_logged {
+                            // A quiet re-attach after "no master deck": not announced each time
+                            continue;
+                        }
                         println!();
                         logger.good("Connected to Rekordbox!");
                         crate::status::shared().update_status(|s| s.rekordbox_connected = true);
@@ -302,15 +370,16 @@ impl BeatKeeper {
 
     
 
+    /// Ok(true) when a master deck was read, Ok(false) when none is selected (or readable).
     fn update(
         &mut self,
         rb: &Rekordbox,
         slow_update: bool,
-    ) -> Result<(), MemoryReadError> {
+    ) -> Result<bool, MemoryReadError> {
         // let masterdeck_index_changed = self.masterdeck_index.set(td.masterdeck_index as usize);
         let masterdeck_index_changed = self.masterdeck_index.set(rb.read_masterdeck_index()?);
         if self.masterdeck_index.value >= rb.deckcount {
-            return Ok(()); // No master deck selected - rekordbox is not initialised
+            return Ok(false); // No master deck selected - rekordbox is not initialised
         }
 
         // let mut tracker_data = None;
@@ -546,7 +615,13 @@ impl BeatKeeper {
             }
         }
 
-        Ok(())
+        Ok(true)
+    }
+
+    fn alive(&mut self, rekordbox_ok: bool) {
+        for module in &mut self.running_modules {
+            module.alive(rekordbox_ok);
+        }
     }
 
     fn report_error(&mut self, e: MemoryReadError) {

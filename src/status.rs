@@ -87,6 +87,8 @@ pub struct Shared {
     pub packets_sent: AtomicU64,
     /// Set by the GUI to re-send the cached track, tempo and phrase now
     pub resend_requested: AtomicBool,
+    /// Set by the GUI or an OSC /rkbx/reconnect to drop the Rekordbox connection and attach again
+    pub reconnect_requested: AtomicBool,
 }
 
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
@@ -100,6 +102,7 @@ pub fn shared() -> &'static Arc<Shared> {
             osc_target_generation: AtomicU64::new(0),
             packets_sent: AtomicU64::new(0),
             resend_requested: AtomicBool::new(false),
+            reconnect_requested: AtomicBool::new(false),
         })
     })
 }

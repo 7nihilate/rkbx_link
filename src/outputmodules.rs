@@ -39,6 +39,11 @@ pub trait OutputModule {
     fn next_phrase_in_master(&mut self, _beats: i32) {}
 
     fn slow_update(&mut self) {}
+
+    /// Called on every keeper loop, also while Rekordbox is missing or has no master deck, so a
+    /// receiver can tell "rkbx_link is up" from "rkbx_link is gone". `rekordbox_ok`: connected
+    /// and a master deck is selected.
+    fn alive(&mut self, _rekordbox_ok: bool) {}
 }
 
 pub struct ModuleDefinition {

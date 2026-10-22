@@ -2,7 +2,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use rosc::{encoder::encode, OscMessage, OscPacket};
+use rosc::{decoder::decode_udp, encoder::encode, OscMessage, OscPacket};
 
 use crate::{
     beatkeeper::TrackInfo,
@@ -121,6 +121,7 @@ pub struct Osc {
     heartbeat: Option<Duration>,
     last_heartbeat: Instant,
     cache: MasterCache,
+    last_alive: Option<Instant>,
 }
 
 
@@ -192,6 +193,10 @@ impl Osc {
                 return Err(());
             }
         };
+        // Polled for /rkbx/reconnect and /rkbx/resend from the receiver (alive())
+        if let Err(e) = socket.set_nonblocking(true) {
+            logger.warn(&format!("Could not make the OSC socket non-blocking, remote reset is off: {e}"));
+        }
         // Needed to send to a subnet broadcast address in LAN mode
         if let Err(e) = socket.set_broadcast(true) {
             logger.warn(&format!("Could not enable broadcast on the OSC socket: {e}"));
@@ -218,6 +223,7 @@ impl Osc {
             heartbeat: (heartbeat > 0.0).then(|| Duration::from_secs_f32(heartbeat)),
             last_heartbeat: Instant::now(),
             cache: MasterCache::default(),
+            last_alive: None,
         };
         osc.refresh_target();
         Ok(Box::new(osc))
@@ -310,8 +316,47 @@ pub fn target_from_config(conf: &Config, logger: &ScopedLogger) -> OscTarget {
     }
 }
 
+/// Time between /rkbx/alive messages (sent in every state, so a receiver can tell a silent
+/// rkbx_link from a Rekordbox with nothing playing).
+const ALIVE_EVERY: Duration = Duration::from_secs(1);
+
+impl Osc {
+    /// Control messages sent back to the OSC source port: /rkbx/reconnect, /rkbx/resend.
+    fn poll_control(&mut self) {
+        let mut buf = [0u8; 1024];
+        for _ in 0..8 {
+            // Errors include WouldBlock (nothing waiting) and, on Windows, the ICMP "port
+            // unreachable" of a receiver that is not running: all mean "nothing to read".
+            let Ok((len, from)) = self.socket.recv_from(&mut buf) else {
+                return;
+            };
+            let Ok((_, OscPacket::Message(msg))) = decode_udp(&buf[..len]) else {
+                continue;
+            };
+            match msg.addr.as_str() {
+                "/rkbx/reconnect" => {
+                    self.logger.info(&format!("Reconnect requested by {from}"));
+                    shared().reconnect_requested.store(true, Ordering::SeqCst);
+                    shared().resend_requested.store(true, Ordering::SeqCst);
+                }
+                "/rkbx/resend" => shared().resend_requested.store(true, Ordering::SeqCst),
+                _ => {}
+            }
+        }
+    }
+}
+
 // TODO: Avoid formatting strings every loop
 impl OutputModule for Osc {
+    fn alive(&mut self, rekordbox_ok: bool) {
+        self.poll_control();
+        if self.last_alive.is_none_or(|t| t.elapsed() >= ALIVE_EVERY) {
+            self.last_alive = Some(Instant::now());
+            self.refresh_target();
+            self.send_int("/rkbx/alive", rekordbox_ok as i32);
+        }
+    }
+
     fn pre_update(&mut self) {
         self.send_period_counter = (self.send_period_counter + 1) % self.send_period;
         self.refresh_target();

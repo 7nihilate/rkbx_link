@@ -256,6 +256,9 @@ impl eframe::App for App {
                 if ui.button("Resend state").clicked() {
                     shared().resend_requested.store(true, Ordering::SeqCst);
                 }
+                if ui.button("Reconnect to Rekordbox").clicked() {
+                    shared().reconnect_requested.store(true, Ordering::SeqCst);
+                }
             });
             let current = shared()
                 .osc_target()

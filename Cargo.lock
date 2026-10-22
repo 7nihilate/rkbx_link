@@ -3384,7 +3384,6 @@ dependencies = [
  "sacn",
  "sysinfo",
  "termcolor",
- "toy-arms",
  "winapi",
 ]
 
@@ -4257,26 +4256,6 @@ name = "tower-service"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
-
-[[package]]
-name = "toy-arms"
-version = "0.9.4"
-source = "git+https://github.com/grufkork/toy-arms?branch=0.9.4#3d4201e381dd5da6a917fb500f28a8681a3137b1"
-dependencies = [
- "thiserror 1.0.69",
- "toy-arms_derive",
- "winapi",
-]
-
-[[package]]
-name = "toy-arms_derive"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a27243b9968c18c78af6734e3a0b68838856e77a76f1f755f557d991afecfed7"
-dependencies = [
- "quote",
- "syn 1.0.109",
-]
 
 [[package]]
 name = "tracing"
