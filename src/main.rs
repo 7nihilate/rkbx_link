@@ -60,9 +60,29 @@ fn parse_args() -> Args {
 }
 
 fn main() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let what = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown".to_string());
+        let at = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_default();
+        crate::status::shared().push_log(crate::status::LogKind::Error, format!("[Panic]  {what} at {at}"));
+        default_hook(info);
+    }));
     // config and data/offsets are read relative to the working directory: use the
-    // exe's folder, so it works when started from a shortcut or from another program
-    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+    // exe's folder, so it works when started from a shortcut or from another program.
+    // A build in the repo (target/release/rkbx_link.exe) has no config next to it, so
+    // the nearest folder up the tree that has one wins (the repo root).
+    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        let dir = exe_dir
+            .ancestors()
+            .take(4)
+            .find(|d| d.join("config").is_file())
+            .unwrap_or(&exe_dir)
+            .to_path_buf();
         let _ = std::env::set_current_dir(dir);
     }
 

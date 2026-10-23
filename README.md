@@ -93,6 +93,9 @@ Time in milliseconds to shift the output. Used to compensate for latency in audi
 - `keeper.keep_warm <true/false>`
 Enabling this means all decks are tracked even when not active. Enabling this increases CPU usage a bit, but means that when you switch decks the new one will already be tracked and ready to go. Default is `true`. If you are outputting data from non-master decks, ensure this is on.
 
+- `keeper.follow_playing <true/false>`
+Rekordbox leaves MASTER on a stopped deck while another deck plays, unless sync moves it. With this on, the `master` output follows the deck that is actually playing: Rekordbox's master once it plays, else the deck that plays (a deck must play for 1 s to take over from another playing deck, so a cue preview does not, or 0.3 s after a stop). With nothing playing the last followed deck stays. Default is `true`; `false` always follows Rekordbox's MASTER.
+
 - `keeper.decks <int>`
 Number of decks to track, 1 to 4. This decides how many decks are read from Rekordbox's memory. If you choose more decks than are active in Rekordbox, the program will fail due to trying read decks where the are not any.
 

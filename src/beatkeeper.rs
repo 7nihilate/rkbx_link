@@ -15,8 +15,74 @@ use std::io::Cursor;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::memory::Value;
+
+/// A deck whose position has not changed for this long is not playing.
+const STILL_AFTER: Duration = Duration::from_millis(250);
+/// How long a deck must play before it takes over from a deck that is playing too.
+/// Keeps a cue preview on the other deck from pulling the output over.
+const TAKEOVER_WHILE_PLAYING: Duration = Duration::from_millis(1000);
+/// How long a deck must play before it takes over from a stopped deck.
+const TAKEOVER_WHILE_STOPPED: Duration = Duration::from_millis(300);
+
+/// Whether a deck plays, from its sample position: Rekordbox has no play flag we read.
+#[derive(Clone, Default)]
+struct DeckMotion {
+    last_position: Option<i64>,
+    last_change: Option<Instant>,
+    /// When the current run of position changes began, None while the deck stands still
+    moving_since: Option<Instant>,
+}
+
+impl DeckMotion {
+    fn observe(&mut self, position: i64, now: Instant) {
+        if self.last_position.is_some_and(|p| p != position) {
+            self.last_change = Some(now);
+            self.moving_since.get_or_insert(now);
+        }
+        self.last_position = Some(position);
+        if self.last_change.is_none_or(|t| now - t > STILL_AFTER) {
+            self.moving_since = None;
+        }
+    }
+
+    fn playing(&self) -> bool {
+        self.moving_since.is_some()
+    }
+
+    fn played_for(&self, now: Instant) -> Duration {
+        self.moving_since.map_or(Duration::ZERO, |t| now - t)
+    }
+}
+
+/// The deck to send as master. Rekordbox keeps MASTER on a deck that is stopped while
+/// another one plays (it moves only with sync), so the deck that is heard wins:
+/// Rekordbox's master once it plays, else the deck followed now (`current`, usize::MAX for
+/// none) while it plays, else the deck that has played longest. With nothing playing the
+/// followed deck stays.
+fn pick_master(motion: &[DeckMotion], current: usize, rekordbox_master: usize, now: Instant) -> usize {
+    let decks = motion.len();
+    let current_playing = current < decks && motion[current].playing();
+    let takeover = if current_playing { TAKEOVER_WHILE_PLAYING } else { TAKEOVER_WHILE_STOPPED };
+    let established = |i: usize| i == current || motion[i].played_for(now) >= takeover;
+
+    if rekordbox_master < decks && motion[rekordbox_master].playing() && established(rekordbox_master) {
+        return rekordbox_master;
+    }
+    if current_playing {
+        return current;
+    }
+    let longest = (0..decks)
+        .filter(|&i| motion[i].playing() && established(i))
+        .max_by_key(|&i| motion[i].played_for(now));
+    match longest {
+        Some(deck) => deck,
+        None if current < decks => current,
+        None => rekordbox_master,
+    }
+}
 
 
 
@@ -170,7 +236,11 @@ impl<T: std::cmp::PartialEq> ChangeTrackedValue<T> {
 }
 
 pub struct BeatKeeper {
+    /// The deck sent as master: Rekordbox's master deck, or with follow_playing the deck
+    /// that is actually playing. usize::MAX until the first update.
     masterdeck_index: ChangeTrackedValue<usize>,
+    follow_playing: bool,
+    motion: Vec<DeckMotion>,
     offset_samples: i64,
     running_modules: Vec<Box<dyn OutputModule>>,
 
@@ -256,7 +326,9 @@ impl BeatKeeper {
         };
 
         let mut keeper = BeatKeeper {
-            masterdeck_index: ChangeTrackedValue::new(0),
+            masterdeck_index: ChangeTrackedValue::new(usize::MAX),
+            follow_playing: keeper_config.get_or_default("follow_playing", true),
+            motion: vec![DeckMotion::default(); 4],
             offset_samples: (keeper_config.get_or_default("delay_compensation", 0.) * 44100. / 1000.) as i64,
             track_infos: vec![ChangeTrackedValue::new(Default::default()); 4],
             running_modules,
@@ -299,7 +371,23 @@ impl BeatKeeper {
             }
             if let Some(rb) = &mut rekordbox {
                 let update_start_time = std::time::Instant::now();
-                match keeper.update(rb, n == 0) {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| keeper.update(rb, n == 0)));
+                let result = match result {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // The panic hook (main.rs) has logged what and where. Start clean: the
+                        // track data is read again after the reconnect.
+                        logger.err("Internal error while reading Rekordbox (see the panic above), reconnecting");
+                        keeper.reset_tracks();
+                        rekordbox = None;
+                        no_master_since = None;
+                        crate::status::shared().update_status(|s| s.rekordbox_connected = false);
+                        keeper.alive(false);
+                        thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                };
+                match result {
                     Err(e) => {
                         keeper.alive(false);
                         keeper.report_error(e);
@@ -376,10 +464,32 @@ impl BeatKeeper {
         rb: &Rekordbox,
         slow_update: bool,
     ) -> Result<bool, MemoryReadError> {
-        // let masterdeck_index_changed = self.masterdeck_index.set(td.masterdeck_index as usize);
-        let masterdeck_index_changed = self.masterdeck_index.set(rb.read_masterdeck_index()?);
-        if self.masterdeck_index.value >= rb.deckcount {
+        let rekordbox_master = rb.read_masterdeck_index()?;
+        if rekordbox_master >= rb.deckcount {
             return Ok(false); // No master deck selected - rekordbox is not initialised
+        }
+        let master = if self.follow_playing {
+            let now = Instant::now();
+            for i in 0..self.decks.min(rb.deckcount) {
+                if let Ok(position) = rb.sample_positions[i].read(&rb.mem) {
+                    self.motion[i].observe(position, now);
+                }
+            }
+            self.pick_master(rekordbox_master, now)
+        } else {
+            rekordbox_master
+        };
+        let masterdeck_index_changed = self.masterdeck_index.set(master);
+        if masterdeck_index_changed {
+            if master == rekordbox_master {
+                self.logger.info(&format!("Following deck {} (Rekordbox master)", master + 1));
+            } else {
+                self.logger.info(&format!(
+                    "Following deck {}, it plays while the Rekordbox master (deck {}) does not",
+                    master + 1,
+                    rekordbox_master + 1
+                ));
+            }
         }
 
         // let mut tracker_data = None;
@@ -618,10 +728,31 @@ impl BeatKeeper {
         Ok(true)
     }
 
+    fn pick_master(&self, rekordbox_master: usize, now: Instant) -> usize {
+        let decks = self.decks.min(self.motion.len());
+        pick_master(&self.motion[0..decks], self.masterdeck_index.value, rekordbox_master, now)
+    }
+
     fn alive(&mut self, rekordbox_ok: bool) {
         for module in &mut self.running_modules {
             module.alive(rekordbox_ok);
         }
+    }
+
+    /// Forget every deck's track, beat grid and phrases, so they are read again.
+    fn reset_tracks(&mut self) {
+        self.track_trackers = (0..4).map(|_| TrackTracker::new()).collect();
+        self.td_trackers = (0..4).map(|_| TrackingDataTracker::new()).collect();
+        self.master_td_tracker = TrackingDataTracker::new();
+        self.motion = vec![DeckMotion::default(); 4];
+        for path in &self.anlz_paths {
+            if !path.value.is_empty() {
+                let _ = self.watcher.unwatch(std::path::Path::new(&path.value));
+                let _ = self.watcher.unwatch(std::path::Path::new(&path.value.replace(".DAT", ".EXT")));
+            }
+        }
+        self.anlz_paths = vec![ChangeTrackedValue::new("".to_string()); 4];
+        self.track_infos = vec![ChangeTrackedValue::new(Default::default()); 4];
     }
 
     fn report_error(&mut self, e: MemoryReadError) {
@@ -715,7 +846,7 @@ impl TrackTracker {
 
         let time_now = (td.sample_position + offset_samples) as f32 / 44100.;
         let mut beat_idx: usize = 0;
-        if let Some(grid) = &self.beatgrid {
+        if let Some(grid) = self.beatgrid.as_ref().filter(|g| !g.beats.is_empty()) {
             for gridbeat in grid.beats.iter() {
                 if gridbeat.time as f32 / 1000. >= time_now {
                     break;
@@ -747,7 +878,7 @@ impl TrackTracker {
         };
 
         let mut phrase_idx: usize = 0;
-        if let Some(songstructure) = &self.songstructure {
+        if let Some(songstructure) = self.songstructure.as_ref().filter(|s| !s.phrases.is_empty()) {
             // println!("Song structure: {:?}", songstructure);
             for phrase in songstructure.phrases.iter() {
                 // println!("beat {} / {beat_idx}", phrase.beat);
@@ -770,5 +901,87 @@ impl TrackTracker {
         }
 
         Ok(tout)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two decks read every 10 ms. `moving[d]` says whether deck d plays during the run; the
+    /// followed deck is carried in and returned.
+    struct Sim {
+        motion: Vec<DeckMotion>,
+        positions: [i64; 2],
+        now: Instant,
+        current: usize,
+    }
+
+    impl Sim {
+        fn new() -> Self {
+            Self { motion: vec![DeckMotion::default(); 2], positions: [1000, 5000], now: Instant::now(), current: usize::MAX }
+        }
+
+        fn run(&mut self, ms: u64, moving: [bool; 2], rekordbox_master: usize) -> usize {
+            for _ in 0..ms / 10 {
+                self.now += Duration::from_millis(10);
+                for d in 0..2 {
+                    if moving[d] {
+                        self.positions[d] += 441;
+                    }
+                    self.motion[d].observe(self.positions[d], self.now);
+                }
+                self.current = pick_master(&self.motion, self.current, rekordbox_master, self.now);
+            }
+            self.current
+        }
+    }
+
+    #[test]
+    fn nothing_playing_follows_rekordbox_master() {
+        let mut sim = Sim::new();
+        assert_eq!(sim.run(500, [false, false], 1), 1);
+    }
+
+    #[test]
+    fn playing_deck_wins_over_a_stopped_master() {
+        let mut sim = Sim::new();
+        sim.run(200, [false, false], 1);
+        // Deck 1 is MASTER but parked, deck 0 plays
+        assert_eq!(sim.run(200, [true, false], 1), 1, "not before the takeover time");
+        assert_eq!(sim.run(300, [true, false], 1), 0);
+        assert_eq!(sim.run(5000, [true, false], 1), 0);
+    }
+
+    #[test]
+    fn cue_preview_does_not_take_over() {
+        let mut sim = Sim::new();
+        sim.run(1000, [true, false], 0);
+        assert_eq!(sim.run(600, [true, true], 0), 0);
+        assert_eq!(sim.run(1000, [true, false], 0), 0);
+    }
+
+    #[test]
+    fn master_takes_back_once_it_plays() {
+        let mut sim = Sim::new();
+        sim.run(1000, [true, false], 1);
+        assert_eq!(sim.current, 0);
+        assert_eq!(sim.run(500, [true, true], 1), 0, "a short run of the master is not enough");
+        assert_eq!(sim.run(800, [true, true], 1), 1);
+    }
+
+    #[test]
+    fn followed_deck_stays_when_everything_stops() {
+        let mut sim = Sim::new();
+        sim.run(1000, [true, false], 1);
+        assert_eq!(sim.run(2000, [false, false], 1), 0);
+    }
+
+    #[test]
+    fn next_deck_takes_over_quickly_after_a_stop() {
+        let mut sim = Sim::new();
+        sim.run(1000, [true, false], 1);
+        sim.run(1000, [false, false], 1);
+        assert_eq!(sim.run(500, [false, true], 1), 1);
     }
 }
